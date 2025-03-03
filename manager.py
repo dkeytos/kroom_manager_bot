@@ -295,23 +295,38 @@ async def run_monitor(telegram_client, target_entity):
                     # Process closed positions 
                     closed_positions = [pid for pid in last_positions if pid not in current_positions]
                     for pos_id in closed_positions:
-                        # No sleep needed here - we'll process immediately
-                        # but be aware the closing info might need a moment to appear in history
-                        closed_deals = [
-                            deal for deal in history_storage.deals 
-                            if deal.get("positionId") == pos_id and deal.get("entryType") == "DEAL_ENTRY_OUT"
-                        ]
+                        # Find the closing deal with multiple retries if needed
+                        max_retries = 10
+                        retry_count = 0
+                        delay = 0.1  # starting delay in seconds
+                        closed_deals = []
                         
-                        # If we don't find the closing deal immediately, wait a moment and try once more
-                        if not closed_deals:
-                            # Short wait to allow history to update if needed
-                            await asyncio.sleep(0.1)
+                        while retry_count < max_retries and not closed_deals:
                             closed_deals = [
                                 deal for deal in history_storage.deals 
                                 if deal.get("positionId") == pos_id and deal.get("entryType") == "DEAL_ENTRY_OUT"
                             ]
+                            
+                            if closed_deals:
+                                # Found the closing deal, break the loop
+                                msg_logger.info(f"Found closing deal for position {pos_id} after {retry_count} retries")
+                                break
+                                
+                            # Wait before trying again with increasing delay
+                            retry_count += 1
+                            await asyncio.sleep(delay)
+                            # Increase delay for next attempt (capped at 1 second)
+                            delay = min(delay * 1.5, 1.0)
+                            
+                            # Refresh history storage if possible
+                            try:
+                                await connection.refresh_history_storage()
+                                msg_logger.info(f"Refreshed history storage while searching for position {pos_id} closing deal")
+                            except Exception as refresh_err:
+                                logger.warning(f"Could not refresh history: {refresh_err}")
                         
                         if closed_deals:
+                            # Process the closing deal as before
                             closing_deal = closed_deals[0]
                             closing_price = closing_deal.get("price")
                             open_price, tp, sl, trade_type, symbol, _ = last_positions.get(pos_id, (None, None, None, None, "N/A", None))
@@ -382,9 +397,11 @@ async def run_monitor(telegram_client, target_entity):
                                 await send_telegram_message(telegram_client, target_entity,
                                     f"🔴 **CLOSE {symbol}**\nID: {pos_id}\n\nMissing price data.")
                         else:
+                            # After exhausting all retries, send failure message
                             open_price, tp, sl, trade_type, symbol, _ = last_positions.get(pos_id, (None, None, None, None, "N/A", None))
+                            msg_logger.warning(f"Failed to find closing deal for position {pos_id} after {max_retries} retries")
                             await send_telegram_message(telegram_client, target_entity,
-                                f"🔴 **CLOSE {symbol}**\nID: {pos_id}\n\nNo closing deal found.")
+                                f"🔴 **CLOSE {symbol}**\nID: {pos_id}\n\nNo closing deal found after multiple attempts.")
                         
                         # Update the pinned status message after each position closes
                         status_message = await generate_status_message(
